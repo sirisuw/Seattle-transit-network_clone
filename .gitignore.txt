@@ -1,0 +1,5 @@
+venv/
+*.zip
+.Rhistory
+.RData
+.Rproj.user/
