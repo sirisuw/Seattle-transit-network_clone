@@ -1,0 +1,413 @@
+---
+title: "How Resilient Is Seattle's Transit Network?"
+subtitle: "Chokepoints and fragmentation in the King County Metro GTFS network"
+author: "Siri Suwannatee (Ty)"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup-knitr, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", out.width = "100%")
+```
+
+# Summary
+
+This project treats Seattle's transit system as a network and asks what happens
+when stops fail. Each stop in the King County Metro schedule feed is a node, and
+two stops are tied when a vehicle serves them back to back on a trip. The network
+has 6,271 stops and 7,025 ties. I describe its structure, rank stops by
+betweenness centrality to find the bridges between neighborhoods, and then remove
+stops in three ways (at random, by highest degree, and by highest betweenness)
+while tracking the size of the largest connected piece.
+
+Two results stand out.
+
+1. **The biggest chokepoint is the SR 520 floating bridge corridor, not downtown
+   Seattle.** The five highest-betweenness stops all sit on it, and each has only
+   4 to 7 direct connections.
+2. **Fragmentation does not follow the usual textbook pattern.** Removing the
+   highest-degree stops broke the network fastest. After 5% of stops were
+   removed, the largest connected piece fell from 99.5% to about 42% of stops.
+   Betweenness-targeted removal halved the network at about 14% removed, and
+   random removal at about 17%.
+
+The network is mostly long chains of stops joined by a thin layer of junctions,
+and that structure explains why it fails the way it does.
+
+# Data and Setup
+
+## Packages
+
+```{r packages}
+library(readr)     # reading the CSV files
+library(dplyr)     # data wrangling
+library(tidyr)     # reshaping data for plots
+library(tibble)    # tidy tables
+library(knitr)     # clean tables
+library(igraph)    # network analysis
+library(ggraph)    # network visualization
+library(ggplot2)   # general plotting
+
+theme_set(theme_minimal(base_size = 12))
+```
+
+## About the data
+
+The data come from the King County Metro General Transit Feed Specification
+(GTFS) schedule feed, published by King County Metro Transit and available at
+<https://metro.kingcounty.gov/GTFS/google_transit.zip> (mirror:
+<https://www.soundtransit.org/GTFS-KCM/google_transit.zip>). I downloaded it on
+November 18, 2026. It is version FAL26-161.5 and covers scheduled service from
+October 29, 2026 to March 26, 2027. GTFS is the standard open format transit
+agencies use to publish schedules. This feed includes Metro bus service, the
+Seattle Streetcar, the King County Water Taxi, Sound Transit Link light rail, and
+some Sound Transit Express service (142 routes and 31,484 trips). Because GTFS is
+schedule data, the network shows planned service, not ridership or real-time
+operations.
+
+I converted the feed into two tables by sorting `stop_times.txt` by trip and stop
+sequence and linking each stop to the next one:
+
+- `nodes.csv` has one row per stop: `id`, `name`, `x` and `y` (longitude and
+  latitude), plus precomputed `degree` and `betweenness` used for checking.
+- `edges.csv` has one row per tie: `from` and `to`, the stop ids served
+  consecutively on at least one trip.
+
+The network is one-mode, undirected, and unweighted. A tie means that a vehicle
+travels directly between two stops, in either direction.
+
+> Data credit (required by King County): *Transit scheduling, geographic, and
+> real-time data provided by permission of King County.*
+
+## Building the graph
+
+```{r build-graph}
+nodes <- read_csv("nodes.csv", show_col_types = FALSE)
+edges <- read_csv("edges.csv", show_col_types = FALSE)
+
+g <- graph_from_data_frame(d = edges, vertices = nodes, directed = FALSE)
+
+g
+```
+
+The graph has 6,271 nodes and 7,025 ties. These counts use raw stop IDs. The same
+physical stop is often split into several IDs by direction or bay, so I test a
+merged version in the sensitivity check near the end.
+
+# Exploring the Network
+
+## Map of the network
+
+The plot uses each stop's real longitude and latitude, so the network keeps the
+shape of the region. Node size shows betweenness centrality (how often a stop lies
+on shortest routes between other stops). Node color shows degree (the number of
+direct connections). The five highest-betweenness stops are ringed in red.
+
+```{r geo-plot, fig.width=9, fig.height=9}
+V(g)$betweenness_r <- betweenness(g, directed = FALSE, normalized = TRUE)
+top5 <- V(g)$name[order(-V(g)$betweenness_r, V(g)$name)][1:5]
+V(g)$is_top5 <- V(g)$name %in% top5
+
+ggraph(g, layout = "manual", x = V(g)$x, y = V(g)$y) +
+  geom_edge_link(alpha = 0.25, colour = "grey60") +
+  geom_node_point(aes(size = betweenness_r, colour = degree)) +
+  geom_node_point(aes(filter = is_top5), shape = 21, size = 9,
+                  stroke = 1.4, colour = "red", fill = NA) +
+  scale_colour_viridis_c(option = "plasma", name = "Degree") +
+  scale_size_continuous(name = "Betweenness", range = c(0.4, 7)) +
+  labs(title = "Seattle transit: the SR 520 bridge corridor is the chokepoint",
+       subtitle = "Node size = betweenness, color = degree, red rings = top 5 betweenness stops",
+       caption = "King County Metro GTFS FAL26-161.5. Data provided by permission of King County.") +
+  theme_graph()
+```
+
+The network is dense on the west side (Seattle itself) and thins into long
+suburban chains to the east and south. The red-ringed stops all sit on the SR 520
+corridor at the east end of the floating bridge, the main crossing of Lake
+Washington. The largest dots are not the yellowest ones: the bridge stops have
+modest degree (4 to 7) but very high betweenness. They act as brokers, not hubs.
+
+## Degree distribution
+
+```{r degree-dist, fig.width=8, fig.height=4.5}
+tibble(degree = degree(g)) %>%
+  ggplot(aes(x = degree)) +
+  geom_histogram(binwidth = 1, fill = "#4C72B0", colour = "white") +
+  labs(title = "Degree distribution of Seattle transit stops",
+       x = "Degree (number of direct connections)", y = "Number of stops")
+```
+
+This is not a hub-dominated, scale-free distribution. About 84% of stops have
+degree exactly 2: the stop before and the stop after on a route. The average
+degree is 2.24 and the maximum is 14 (South Kirkland Park & Ride). Only 382 stops
+have degree 4 or more. Most of the analysis below follows from this chain-like
+structure.
+
+# Analysis
+
+## Basic structure
+
+```{r basic-stats}
+n_components   <- components(g)$no
+largest_share  <- max(components(g)$csize) / vcount(g)
+clustering_avg <- transitivity(g, type = "average")
+diam_lcc       <- diameter(g, directed = FALSE)
+avg_path       <- mean_distance(g, directed = FALSE)
+
+tibble(
+  Measure = c("Nodes", "Ties", "Components", "Largest component share",
+              "Average clustering", "Diameter (stops)", "Average shortest path (stops)"),
+  Value   = c(vcount(g), ecount(g), n_components,
+              round(largest_share, 4), round(clustering_avg, 4),
+              diam_lcc, round(avg_path, 2))
+) %>%
+  kable()
+```
+
+The network is nearly one connected system: the largest component holds 99.47% of
+stops. Clustering is very low (0.014) because routes are chains and rarely close
+into triangles. Trips are long when counted in stops, with an average shortest
+path of about 29 stops and a diameter of 93.
+
+The four components are:
+
+- the mainland network (6,238 stops),
+- a 29-stop component of Vashon Island bus stops, reachable from the mainland only
+  by ferry in real life, and
+- two 2-stop Water Taxi components.
+
+The Water Taxi split is a data artifact. The two routes share Colman Dock in
+reality, but the feed gives the dock a different stop ID for each route, so the
+graph cannot see the transfer. I left it in because it shows how data conventions
+shape network structure.
+
+## Betweenness: finding the bridges
+
+```{r betweenness-table}
+tibble(Stop = V(g)$name,
+       Betweenness = round(V(g)$betweenness_r, 3),
+       Degree = degree(g)) %>%
+  arrange(desc(Betweenness)) %>%
+  slice_head(n = 10) %>%
+  kable()
+```
+
+One corridor dominates the top of the ranking. SR 520 & 92nd Ave NE has
+betweenness of about 0.195 and degree 6, and the Evergreen Point stops sit at the
+east end of the bridge. Six of the top 20 stops are on SR 520. A smaller group
+sits around Renton Transit Center. No Link light rail station and no stop in the
+downtown core appears in the top 20. Downtown has many parallel routes, which
+probably spreads shortest paths across dozens of stops so that no single one is
+critical. The fragile points are in the suburbs, where one bridge or one arterial
+carries most of the traffic between areas.
+
+The ranking also shows the broker pattern. Bellevue Transit Center - Bay 6 has
+degree 2 but ranks 9th by betweenness. A degree-only analysis would call it
+unimportant, while betweenness shows it is a key link between two chains.
+
+## Resilience test: three ways to break the network
+
+The main experiment removes stops in 1% steps up to 50% removed, using three
+strategies:
+
+- **Random** failure (mean of 10 trials), as a model of everyday disruption.
+- **Degree-targeted** removal, best-connected stops first.
+- **Betweenness-targeted** removal, biggest bridges first.
+
+After each step I record the size of the largest remaining component as a
+fraction of the original 6,271 stops.
+
+```{r resilience}
+set.seed(20261118)
+
+largest_fraction <- function(graph) {
+  if (vcount(graph) == 0) return(0)
+  max(components(graph)$csize) / vcount(g)
+}
+
+attack_curve <- function(order_names, steps = 0:50) {
+  sapply(steps, function(p) {
+    k <- floor(p / 100 * vcount(g))
+    if (k == 0) return(largest_fraction(g))
+    largest_fraction(delete_vertices(g, order_names[seq_len(k)]))
+  })
+}
+
+steps <- 0:50
+deg_order <- V(g)$name[order(-degree(g), V(g)$name)]
+bet_order <- V(g)$name[order(-V(g)$betweenness_r, V(g)$name)]
+
+resilience <- tibble(
+  pct_removed = steps,
+  `Degree-targeted`      = attack_curve(deg_order, steps),
+  `Betweenness-targeted` = attack_curve(bet_order, steps),
+  Random = rowMeans(replicate(10, attack_curve(sample(V(g)$name), steps)))
+)
+
+resilience %>%
+  tidyr::pivot_longer(-pct_removed, names_to = "Strategy", values_to = "Largest component") %>%
+  ggplot(aes(x = pct_removed, y = `Largest component`, colour = Strategy)) +
+  geom_line(linewidth = 1.1) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title = "Resilience: largest component vs. stops removed",
+       x = "Stops removed (%)", y = "Largest component (fraction of original stops)",
+       caption = "King County Metro GTFS FAL26-161.5. Data provided by permission of King County.")
+```
+
+This differs from the standard textbook result. In hub-dominated networks,
+degree-targeted attacks are devastating, betweenness attacks are usually
+comparable, and random failure does little harm. Here:
+
+- Degree-targeted removal fragments the network fastest. The largest component
+  drops below 50% at 5% removed, with about 42% of stops still in it at that point.
+- Betweenness-targeted removal halves the network at about 14% removed.
+- Random removal halves it at about 17%. Even random failure does real damage,
+  because with an average degree of 2.24 there is little redundancy anywhere.
+
+A note on reproducibility: many stops share the same degree, so the exact
+degree-attack curve depends on how ties are broken. The orders above break ties
+by stop name, which makes this page reproducible. The ranking of the three
+strategies (degree fastest, then betweenness, then random) should hold under other
+tie-breaking choices, but the exact percentages can shift by a few points.
+
+Why does the degree attack win? In a chain-like network the high-degree stops are
+not a few superstar hubs. They are the whole junction layer (all 382 stops with
+degree 4 or more) that ties the routes together, and removing them cuts the chains
+apart everywhere at once. The top-betweenness stops, by contrast, sit in series
+along a few corridors like SR 520. Once the first bridge stop is gone, its
+neighbors lose most of their betweenness too, so a static betweenness attack
+spends many removals on corridors that are already cut.
+
+## A second measure: do trips survive, and at what cost?
+
+Largest-component size shows when the network splits, but not when it stops being
+usable. As a second measure I sampled 300 pairs of stops and, at each removal
+step, recorded the share of pairs still connected and the average shortest path
+among the pairs that remain connected.
+
+```{r path-measure}
+set.seed(20261118)
+lcc <- induced_subgraph(g, names(which(components(g)$membership ==
+                                       which.max(components(g)$csize))))
+pair_sample <- replicate(300, sample(V(lcc)$name, 2), simplify = FALSE)
+
+pair_stats <- function(order_names, steps = 0:50) {
+  t(sapply(steps, function(p) {
+    k <- floor(p / 100 * vcount(g))
+    h <- if (k == 0) g else delete_vertices(g, order_names[seq_len(k)])
+    d <- sapply(pair_sample, function(pr) {
+      if (!all(pr %in% V(h)$name)) return(NA_real_)
+      dd <- distances(h, v = pr[1], to = pr[2])[1, 1]
+      ifelse(is.infinite(dd), NA_real_, dd)
+    })
+    c(share_connected = mean(!is.na(d)), avg_path = mean(d, na.rm = TRUE))
+  }))
+}
+
+path_deg <- pair_stats(deg_order)
+path_bet <- pair_stats(bet_order)
+
+# Selected rows, printed so the numbers quoted below can be checked.
+tibble(`Removed (%)` = steps,
+       `Degree: pairs connected` = round(path_deg[, "share_connected"], 3),
+       `Degree: avg path` = round(path_deg[, "avg_path"], 1),
+       `Betweenness: pairs connected` = round(path_bet[, "share_connected"], 3),
+       `Betweenness: avg path` = round(path_bet[, "avg_path"], 1)) %>%
+  filter(`Removed (%)` %in% c(0, 2, 4, 6, 8, 10, 15, 20)) %>%
+  kable()
+```
+
+I did not run this measure for random removal. Two points come out of the table.
+
+First, pair connectivity falls at least as fast as the largest component. Under the
+degree attack the share of connected pairs drops from 72% at 4% removed to 26% at
+5%, so it falls below half at 5%. Under the betweenness attack it falls below half
+at about 10% removed, compared with 14% for the largest component. A trip fails if
+either endpoint is removed or if the path between them is cut.
+
+Second, trips get much longer before they become impossible. Under the
+betweenness attack the average path among surviving pairs grows from 29 stops to about
+100 stops by 7 to 9% removed (a peak of about 107 at 9%). Under the degree
+attack it reaches about 98 stops at 4% removed. Removing junctions and bridges
+forces long detours along the chains.
+
+After the peak, average path length falls again. That is not a recovery. It
+happens because only short local trips are still possible, so the average is taken
+over a shrinking and increasingly local set of pairs. The two measures should be
+read together: the largest component shows when the network splits, and path
+length shows when it stops being usable.
+
+## Sensitivity check: does merging duplicate stops change the answer?
+
+The counts above use raw stop IDs, but agencies often split one physical stop into
+several IDs by direction or bay. For example, Sr 520 & Evergreen Point Rd holds
+both the #2 and #3 betweenness ranks. The usual merging key, `parent_station`, is
+blank for all 6,271 stops in this feed, so I merged stops with the same name and
+the same coordinates rounded to 3 decimal places.
+
+```{r merge-check}
+nodes_merged <- nodes %>%
+  mutate(key = paste(name, round(x, 3), round(y, 3))) %>%
+  group_by(key) %>%
+  summarise(id_new = first(id), x = mean(x), y = mean(y), .groups = "drop")
+
+id_map <- nodes %>%
+  mutate(key = paste(name, round(x, 3), round(y, 3))) %>%
+  left_join(nodes_merged %>% select(key, id_new), by = "key") %>%
+  select(id, id_new)
+
+edges_merged <- edges %>%
+  left_join(id_map, by = c("from" = "id")) %>% rename(from_new = id_new) %>%
+  left_join(id_map, by = c("to" = "id"))   %>% rename(to_new = id_new) %>%
+  filter(from_new != to_new) %>%
+  distinct(from = from_new, to = to_new)
+
+g_merged <- graph_from_data_frame(edges_merged,
+                                  vertices = nodes_merged %>% rename(id = id_new) %>%
+                                    select(id, x, y),
+                                  directed = FALSE)
+c(nodes_merged = vcount(g_merged), ties_merged = ecount(g_merged),
+  largest_share_merged = round(max(components(g_merged)$csize) / vcount(g_merged), 4))
+```
+
+Merging removes 881 duplicate stop IDs and gives 5,390 nodes and 6,976 ties. The
+largest component still holds 99.46% of stops, and the corridor chokepoints stay
+the same. The main results do not depend on the stop-ID convention. I keep the
+raw-ID network as the primary analysis because it is the feed's own unit, and I
+treat the merged network as a robustness check.
+
+# Takeaways
+
+Seattle's transit network is held together by a thin layer of modest junctions
+and a few bridges, strung between long chains of ordinary stops. That structure
+makes it fragile in a specific way. Random failures are survivable but not cheap,
+because a chain network has little redundancy. The worst failures are
+concentrated and predictable. Removing 5% of stops by degree cuts the largest
+connected piece from 99.5% to about 42% of the network, and removing
+high-betweenness stops makes the trips that still work far longer (about 29 stops
+growing to about 107 at 9% removed).
+
+For a transit agency, the practical lesson is that resilience planning should
+protect brokers and junctions, not only the busiest stations. The stop that
+matters most may have only two connections and a name nobody recognizes.
+
+This project is also a reminder not to import textbook expectations into real
+networks. The usual finding that networks are robust to random failure but fragile
+to targeted attack assumes a hub-dominated degree distribution, which this network
+does not have. Measuring the network's structure first is what showed that degree
+removal, not betweenness removal, is the most damaging attack here.
+
+# Sources and Credits
+
+Data: King County Metro GTFS feed, version FAL26-161.5, downloaded November 18,
+2026, from <https://metro.kingcounty.gov/GTFS/google_transit.zip>. Transit
+scheduling, geographic, and real-time data provided by permission of King County.
+Analysis and visualization in R with igraph and ggraph.
