@@ -1,5 +1,8 @@
-venv/
-*.zip
 .Rhistory
 .RData
 .Rproj.user/
+*.Rproj
+.DS_Store
+index_files/
+venv/
+*.zip
